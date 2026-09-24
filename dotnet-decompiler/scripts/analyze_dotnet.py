@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""
+analyze_dotnet.py — Scan decompiled .NET source for license logic, API keys, and protection.
+
+Usage:
+    python analyze_dotnet.py decompiled/ --out analysis/
+    python analyze_dotnet.py decompiled/ --json
+"""
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+
+LICENSE_PATTERNS = [
+    (r'(?i)\bLicenseManager\b', 'LicenseManager class'),
+    (r'(?i)\bTrialCheck\b|\bCheckTrial\b|\bisTrial\b', 'Trial validation'),
+    (r'(?i)\bExpiryDate\b|\bExpiration\b|\bValidUntil\b', 'Expiry check'),
+    (r'(?i)\bActivation(?:Key|Code)\b|\bSerial(?:Number|Key)\b', 'Activation key'),
+    (r'(?i)\bHWID\b|\bMachineId\b|\bMachineGuid\b|\bGetDeviceId\b', 'Hardware ID binding'),
+    (r'(?i)\bRegistry\.(Get|Set)Value\b.*(?:License|Key|Serial|Activation)', 'Registry license storage'),
+    (r'(?i)HttpClient.*(?:license|activate|verify|register)', 'License server call'),
+    (r'(?i)\bIsRegistered\b|\bIsActivated\b|\bIsLicensed\b', 'License status check'),
+    (r'(?i)\bMaxTrialDays\b|\bTrialPeriod\b|\bDaysRemaining\b', 'Trial period'),
+    (r'(?i)\bCheckLicense\b|\bValidateLicense\b|\bVerifyLicense\b', 'License validation method'),
+]
+
+SECRET_PATTERNS = [
+    (r'(?i)(?:api[_-]?key|apikey)\s*[=:]\s*["\']([^"\']{8,})["\']', 'API Key'),
+    (r'(?i)(?:secret|token|password)\s*[=:]\s*["\']([^"\']{8,})["\']', 'Secret/Token'),
+    (r'(?i)(?:connection[_-]?string|connstr)\s*[=:]\s*["\']([^"\']{10,})["\']', 'Connection string'),
+    (r'["\'](?:eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,})["\']', 'JWT Token'),
+    (r'["\']([A-Za-z0-9+/]{40,}={0,2})["\']', 'Base64 blob (potential key)'),
+    (r'(?i)(?:Bearer|Basic)\s+[A-Za-z0-9+/=_-]{20,}', 'Auth header'),
+    (r'https?://[^\s"\'<>]{10,}(?:api|auth|license|activate)', 'API endpoint'),
+]
+
+PROTECTION_PATTERNS = [
+    (r'Assembly\.Load\s*\(\s*(?:byte|Convert)', 'Dynamic assembly loading (possible packer)'),
+    (r'(?i)Decrypt(?:String|Method|Resource)', 'String/resource decryptor'),
+    (r'[\x00-\x1f\x80-\x9f]{3,}', 'Unprintable names (obfuscation)'),
+    (r'(?i)AntiTamper|AntiDebug|AntiDump', 'Protection module'),
+    (r'Delegate\s*\(.*\)\s*;.*switch\s*\(', 'Delegate-based control flow (obfuscation)'),
+    (r'(?i)costura\.', 'Costura.Fody embedded assembly'),
+    (r'(?i)IsDebuggerPresent|Debugger\.IsAttached', 'Anti-debug check'),
+]
+
+
+def scan_file(filepath: Path, patterns: list[tuple], max_context: int = 200) -> list[dict]:
+    """Scan a single file against pattern list."""
+    findings = []
+    try:
+        content = filepath.read_text(encoding='utf-8', errors='replace')
+    except Exception:
+        return findings
+
+    for line_no, line in enumerate(content.splitlines(), 1):
+        for pattern, description in patterns:
+            if re.search(pattern, line):
+                findings.append({
+                    'file': str(filepath),
+                    'line': line_no,
+                    'pattern': description,
+                    'context': line.strip()[:max_context],
+                })
+    return findings
+
+
+def scan_directory(source_dir: Path) -> dict:
+    """Scan all source files for patterns."""
+    results = {
+        'license': [],
+        'secrets': [],
+        'protection': [],
+    }
+
+    cs_files = list(source_dir.rglob('*.cs'))
+    txt_files = list(source_dir.rglob('*.txt'))
+    json_files = list(source_dir.rglob('*.json'))
+    all_files = cs_files + txt_files + json_files
+
+    print(f"[*] Scanning {len(all_files)} files ({len(cs_files)} .cs)")
+
+    for filepath in all_files:
+        results['license'].extend(scan_file(filepath, LICENSE_PATTERNS))
+        results['secrets'].extend(scan_file(filepath, SECRET_PATTERNS))
+        results['protection'].extend(scan_file(filepath, PROTECTION_PATTERNS))
+
+    return results
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Analyze decompiled .NET source")
+    ap.add_argument('source_dir', help='Directory with decompiled .cs files')
+    ap.add_argument('--out', default='dotnet-analysis', help='Output directory')
+    ap.add_argument('--json', action='store_true', help='Output as JSON only')
+    args = ap.parse_args()
+
+    source_dir = Path(args.source_dir)
+    if not source_dir.exists():
+        print(f"[!] Not found: {source_dir}", file=sys.stderr)
+        return 1
+
+    results = scan_directory(source_dir)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    (out_dir / 'analysis.json').write_text(
+        json.dumps(results, indent=2, ensure_ascii=False), encoding='utf-8')
+
+    # Summary
+    print(f"\n[+] Analysis complete:")
+    print(f"    License patterns : {len(results['license'])}")
+    print(f"    Secrets/tokens   : {len(results['secrets'])}")
+    print(f"    Protection       : {len(results['protection'])}")
+    print(f"    Report: {out_dir / 'analysis.json'}")
+
+    if results['license']:
+        print(f"\n[!] License logic found:")
+        for f in results['license'][:10]:
+            print(f"    {Path(f['file']).name}:{f['line']} — {f['pattern']}")
+
+    if results['secrets']:
+        print(f"\n[!] Secrets found:")
+        for f in results['secrets'][:10]:
+            print(f"    {Path(f['file']).name}:{f['line']} — {f['pattern']}")
+
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

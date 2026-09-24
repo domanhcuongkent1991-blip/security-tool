@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""
+identify_app.py — Binary Fingerprinting Tool.
+Identifies programming language, compiler, and potential packers/encryption.
+"""
+import argparse
+import re
+import struct
+import sys
+from pathlib import Path
+
+# Markers for languages and compilers
+MARKERS = {
+    'Python': [
+        rb'python[23]\d?\.dll', rb'Py_Initialize', rb'_Py_NoneStruct', rb'Include/Python.h',
+        rb'libpython', rb'__compiled__', rb'nuitka', rb'pyinstaller', rb'pkg_resources'
+    ],
+    'Go': [
+        rb'runtime.go', rb'main.main', rb'go.itab.', rb'runtime.mallocgc', rb'Go build ID'
+    ],
+    'Rust': [
+        rb'rustc', rb'std::', rb'core::', rb'alloc::', rb'__rust_alloc',
+        rb'rust_begin_unwind', rb'rust_panic', rb'\.rs:\d+:\d+',
+        rb'core::panicking', rb'core::result::Result',
+    ],
+    'C# / .NET': [
+        rb'mscoree.dll', rb'_CorExeMain', rb'System.Reflection', rb'mscorlib', rb'CLR'
+    ],
+    'Java': [
+        rb'Ljava/lang/Object;', rb'java.lang', rb'JNI_CreateJavaVM', rb'com.sun.'
+    ],
+    'C++ / Visual Studio': [
+        rb'MSVCP', rb'VCRUNTIME', rb'Microsoft Visual C++', rb'std::string', rb'operator new'
+    ],
+    'Delphi / Lazarus': [
+        rb'TObject', rb'TForm', rb'TApplication', rb'VCL.Forms', rb'LCL.Forms'
+    ]
+}
+
+# Markers for packers and obfuscators
+PACKERS = {
+    'UPX': [rb'UPX0', rb'UPX1', rb'UPX2'],
+    'Nuitka (Onefile)': [rb'KA\x00', rb'NUITKA_ONEFILE_BINARY'],
+    'PyInstaller': [rb'_PYI', rb'pyi-runtime-tmp', rb'pyi-windows-manifest'],
+    'VMProtect': [rb'.vmp0', rb'.vmp1', rb'VMProtect begin'],
+    'Themida': [rb'.themida', rb'Themida_V3'],
+    'VBox / Enigma': [rb'.enigma', rb'Boxed App'],
+    'Fernet (Encryption Indicator)': [rb'cryptography.fernet', rb'[A-Za-z0-9_-]{43}='],
+    'Tauri': [rb'tauri::app', rb'__TAURI__', rb'tauri_runtime', rb'wry::webview', rb'tao::window'],
+}
+
+PE_MACHINE_NAMES = {
+    0x014C: "x86 (32-bit)", 0x8664: "x64", 0xAA64: "ARM64",
+    0x01C0: "ARM", 0x01C4: "ARM Thumb-2", 0x0200: "IA-64",
+}
+
+
+def validate_pe_header(data: bytes):
+    """Return a description when data contains a real PE header, else None.
+
+    The DOS 'MZ' magic alone is not proof of a PE file: truncated or corrupt
+    files (and some text/binary blobs) start with MZ but lack the PE\\0\\0
+    signature at e_lfanew. Only a verified header earns the PE label.
+    """
+    if len(data) < 0x40 or data[:2] != b'MZ':
+        return None
+    e_lfanew = struct.unpack('<I', data[0x3C:0x40])[0]
+    if e_lfanew + 6 > len(data):
+        return None
+    if data[e_lfanew:e_lfanew + 4] != b'PE\x00\x00':
+        return None
+    machine = struct.unpack('<H', data[e_lfanew + 4:e_lfanew + 6])[0]
+    arch = PE_MACHINE_NAMES.get(machine, f"machine 0x{machine:04X}")
+    return f"PE executable (Windows, {arch})"
+
+
+def identify(filepath):
+    p = Path(filepath)
+    if not p.exists():
+        print(f"[!] Error: {filepath} not found.")
+        return None
+
+    print(f"[*] Analyzing Binary: {p.name} ({p.stat().st_size:,} bytes)")
+    data = p.read_bytes()
+    
+    results = {
+        'Language/Compiler': [],
+        'Packer/Protection': [],
+        'Misc/Indicators': []
+    }
+
+    # 1. Check Languages
+    for lang, markers in MARKERS.items():
+        found = False
+        for m in markers:
+            if re.search(m, data):
+                found = True
+                break
+        if found:
+            results['Language/Compiler'].append(lang)
+
+    # 2. Check Packers
+    for packer, markers in PACKERS.items():
+        found = False
+        for m in markers:
+            if re.search(m, data):
+                found = True
+                break
+        if found:
+            results['Packer/Protection'].append(packer)
+
+    # 3. Special case for Nuitka detection
+    if b'nuitka' in data.lower():
+        if 'Python' not in results['Language/Compiler']:
+             results['Language/Compiler'].append('Python (Nuitka)')
+
+    # 3b. Binary format & Java archive / class file detection
+    if data[:4] == b'\xca\xfe\xba\xbe':
+        is_java = False
+        is_macho_fat = False
+        if len(data) >= 8:
+            nfat_arch = struct.unpack('>I', data[4:8])[0]
+            minor, major = struct.unpack('>HH', data[4:8])
+            # Mach-O universal (fat) binary: nfat_arch is arch count (typically 1-4, <= 30)
+            if 1 <= nfat_arch <= 30:
+                if len(data) >= 8 + nfat_arch * 20:
+                    cputype, cpusubtype, offset, size, align = struct.unpack('>IIIII', data[8:28])
+                    if offset + 4 <= len(data) and data[offset:offset+4] in (
+                        b'\xfe\xed\xfa\xce', b'\xce\xfa\xed\xfe',
+                        b'\xfe\xed\xfa\xcf', b'\xcf\xfa\xed\xfe'
+                    ):
+                        is_macho_fat = True
+                if not is_macho_fat and major < 45:
+                    is_macho_fat = True
+
+            if not is_macho_fat and major >= 45:
+                is_java = True
+
+        if is_java:
+            if 'Java' not in results['Language/Compiler']:
+                results['Language/Compiler'].append('Java')
+            results['Misc/Indicators'].append('Java class file (0xCAFEBABE)')
+        elif is_macho_fat:
+            results['Misc/Indicators'].append('Mach-O universal (fat) binary')
+        else:
+            results['Misc/Indicators'].append('0xCAFEBABE signature (ambiguous Java / Mach-O fat binary)')
+    elif data[:4] in (b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf'):
+        results['Misc/Indicators'].append('Mach-O 64-bit binary')
+    elif data[:4] in (b'\xce\xfa\xed\xfe', b'\xfe\xed\xfa\xce'):
+        results['Misc/Indicators'].append('Mach-O 32-bit binary')
+    elif data[:4] in (b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca', b'\xbe\xba\xfe\xca'):
+        results['Misc/Indicators'].append('Mach-O universal (fat) binary')
+    elif data[:4] == b'\x7fELF':
+        results['Misc/Indicators'].append('ELF executable (Linux/Unix)')
+    elif data[:2] == b'MZ':
+        pe_info = validate_pe_header(data)
+        if pe_info:
+            results['Misc/Indicators'].append(pe_info)
+        else:
+            results['Misc/Indicators'].append(
+                'MZ signature but INVALID/truncated PE header (not a valid PE)')
+    elif data[:2] == b'PK':
+        import zipfile, io
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                names = zf.namelist()
+                if 'classes.dex' in names or 'AndroidManifest.xml' in names:
+                    if 'Java' not in results['Language/Compiler']:
+                        results['Language/Compiler'].append('Java')
+                    results['Packer/Protection'].append('Android APK')
+                elif 'META-INF/MANIFEST.MF' in names and any(n.endswith('.class') for n in names):
+                    if 'Java' not in results['Language/Compiler']:
+                        results['Language/Compiler'].append('Java')
+                    if any(n.startswith('WEB-INF/') for n in names):
+                        results['Misc/Indicators'].append('Java WAR archive')
+                    else:
+                        results['Misc/Indicators'].append('Java JAR archive')
+        except Exception:
+            pass
+    
+    # 4. Output Report
+    print("\n" + "=" * 40)
+    print(" FINGERPRINT REPORT")
+    print("=" * 40)
+    
+    for category, items in results.items():
+        print(f"\n[{category}]")
+        if not items:
+            print("  - Unknown / None detected")
+        for item in items:
+            print(f"  [+] {item}")
+    
+    print("\n" + "=" * 40)
+    
+    # Recommendations
+    if 'Python (Nuitka)' in results['Language/Compiler'] or 'Nuitka (Onefile)' in results['Packer/Protection']:
+        print("Recommendation: Use 'nuitka-decryptor' or 'writerpro-pentest' skills.")
+    elif 'UPX' in results['Packer/Protection']:
+        print("Recommendation: Try 'upx -d <file>' to unpack before analysis.")
+    elif 'C# / .NET' in results['Language/Compiler']:
+        print("Recommendation: Use 'dotnet-decompiler' (ilspycmd + de4dot). Then 'dotnet-license-audit' + 'dotnet-license-review'.")
+    elif 'Tauri' in results['Packer/Protection']:
+        print("Recommendation: Use 'tauri-unpacker' to extract web assets, then 'rust-binary-analyzer' for backend.")
+    elif 'Rust' in results['Language/Compiler']:
+        print("Recommendation: Use 'rust-binary-analyzer' for symbol/module map. Use IDA/Ghidra for code.")
+    elif 'PyInstaller' in results['Packer/Protection']:
+        print("Recommendation: Use 'pyinstaller-unpacker' to extract .pyc and decompile.")
+    elif 'Java' in results['Language/Compiler']:
+        if 'Android APK' in results['Packer/Protection']:
+            print("Recommendation: Use 'java-decompiler' with JADX for APK decompilation.")
+        else:
+            print("Recommendation: Use 'java-decompiler' (CFR/Procyon/FernFlower) for decompilation.")
+
+    return results
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python identify_app.py <binary_path>")
+        raise SystemExit(2)
+    try:
+        results = identify(sys.argv[1])
+    except OSError as exc:
+        print(f"[!] Error reading {sys.argv[1]}: {exc}")
+        results = None
+    raise SystemExit(0 if isinstance(results, dict) else 1)
